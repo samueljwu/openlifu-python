@@ -126,6 +126,9 @@ class SolutionAnalysis(DictMixin):
     TIC: Annotated[float | None, OpenLIFUFieldData("Thermal index (TIC)", "Thermal index in cranium (TIC)")] = None
     """Thermal index in cranium (TIC)"""
 
+    per_focus_tic: Annotated[list[float], OpenLIFUFieldData("Per-focus TIC", "Thermal index in cranium computed independently for each focus, before hit-count weighting")] = field(default_factory=list)
+    """Thermal index in cranium computed independently for each focus, before hit-count weighting."""
+
     voltage_V: Annotated[float | None, OpenLIFUFieldData("Voltage (V)", "Voltage applied to the transducer (V)")] = None
     """Voltage applied to the transducer (V)"""
 

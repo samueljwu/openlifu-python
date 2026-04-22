@@ -85,6 +85,11 @@ class Solution:
     what determines how many times each point will be used.
     """
 
+    focal_hit_counts: Annotated[List[int], OpenLIFUFieldData("Focal hit counts", "Number of pulses directed at each focal point per pulse train. Must have the same length as foci and sum to sequence.pulse_count. If empty, equal distribution is assumed.")] = field(default_factory=list)
+    """Number of pulses directed at each focal point per pulse train. Must have the same length as
+    foci and sum to sequence.pulse_count. If empty, equal distribution is assumed.
+    """
+
     # there was "target_id" in the matlab software, but here we do not have the concept of a target ID.
     # I believe this was only needed in the matlab software because solutions were organized by target rather
     # than having their own unique solution ID. We do have unique solution IDs so it's possible we don't need
@@ -132,6 +137,12 @@ class Solution:
                 raise ValueError(f"Apodizations number of foci ({self.apodizations.shape[0]}) does not match delays number of foci ({self.delays.shape[0]})")
             if self.apodizations.shape[1] != self.delays.shape[1]:
                 raise ValueError(f"Apodizations number of elements {self.apodizations.shape[1]} does not match delays shape ({self.delays.shape[1]})")
+        if self.focal_hit_counts:
+            if len(self.focal_hit_counts) != len(self.foci):
+                raise ValueError(f"Focal hit counts length ({len(self.focal_hit_counts)}) does not match number of foci ({len(self.foci)})")
+            if sum(self.focal_hit_counts) != self.sequence.pulse_count:
+                raise ValueError(f"Focal hit counts sum ({sum(self.focal_hit_counts)}) does not match sequence.pulse_count ({self.sequence.pulse_count})")
+
 
 
     def num_foci(self) -> int:
@@ -347,9 +358,14 @@ class Solution:
             solution_analysis.p0_MPa += [1e-6*np.max(p0_Pa)]
         solution_analysis.global_ispta_mWcm2 = float((ita_mWcm2*z_mask).max())
         solution_analysis.MI = (np.max(solution_analysis.mainlobe_pnp_MPa)/np.sqrt(self.pulse.frequency*1e-6))
-        solution_analysis.TIC = np.mean(TIC)
+        solution_analysis.per_focus_tic = TIC.tolist()
+        if self.focal_hit_counts:
+            solution_analysis.TIC = float(np.average(TIC, weights=self.focal_hit_counts))
+            solution_analysis.power_W = float(np.average(power_W, weights=self.focal_hit_counts))
+        else:
+            solution_analysis.TIC = float(np.mean(TIC))
+            solution_analysis.power_W = float(np.mean(power_W))
         solution_analysis.voltage_V = self.voltage
-        solution_analysis.power_W = np.mean(power_W)
         solution_analysis.estimated_tx_temperature_rise_C = self.estimate_tx_temperature_rise(
             t_sec=solution_analysis.sequence_duration_s,
         )
@@ -491,15 +507,17 @@ class Solution:
             intensity_scaled = rescale_data_arr(self.simulation_result['intensity'], units)
         pulsetrain_dutycycle = self.get_pulsetrain_dutycycle()
         treatment_dutycycle = self.get_sequence_dutycycle()
-        pulse_seq = (np.arange(self.sequence.pulse_count) - 1) % self.num_foci() + 1
-        counts = np.zeros((1, 1, 1, self.num_foci()))
-        for i in range(self.num_foci()):
-            counts[0, 0, 0, i] = np.sum(pulse_seq == (i+1))
-        intensity = intensity_scaled.copy(deep=True)
-        isppa_avg = np.sum(np.expand_dims(intensity.data, axis=-1) * counts, axis=-1) / np.sum(counts)
-        intensity.data = isppa_avg * pulsetrain_dutycycle * treatment_dutycycle
-
-        return intensity
+        counts = np.zeros(self.num_foci())
+        if self.focal_hit_counts:
+            for i in range(self.num_foci()):
+                counts[i] = self.focal_hit_counts[i]
+        else:
+            pulse_seq = (np.arange(self.sequence.pulse_count) - 1) % self.num_foci() + 1
+            for i in range(self.num_foci()):
+                counts[i] = np.sum(pulse_seq == (i + 1))
+        weights = xa.DataArray(counts / counts.sum(), dims="focal_point_index")
+        isppa_avg = (intensity_scaled * weights).sum(dim="focal_point_index", keep_attrs=True)
+        return isppa_avg * pulsetrain_dutycycle * treatment_dutycycle
 
     def to_dict(self, include_simulation_data: bool = False) -> dict:
         """Serialize a Solution to a dictionary
