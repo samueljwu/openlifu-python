@@ -17,7 +17,6 @@ import xarray as xa
 from openlifu import bf, geo, seg, sim, xdc
 from openlifu.db.session import Session
 from openlifu.geo import Point
-from openlifu.plan.hit_count_optimizer import optimize_hit_counts
 from openlifu.plan.param_constraint import ParameterConstraint
 from openlifu.plan.solution import Solution
 from openlifu.plan.solution_analysis import SolutionAnalysis, SolutionAnalysisOptions
@@ -77,6 +76,9 @@ class Protocol:
     virtual_fit_options: Annotated[VirtualFitOptions, OpenLIFUFieldData("Virtual fit options", "Configuration of the virtual fit algorithm")] = field(default_factory=VirtualFitOptions)
     """Configuration of the virtual fit algorithm"""
 
+    scaling_options: Annotated[dict, OpenLIFUFieldData("Scaling options", "Options to adjust solution scaling. By default, no additional scaling options are applied")] = field(default_factory=dict)
+    """Options to adjust solution scaling. By default, no additional scaling options are applied"""
+
     def __post_init__(self):
         self.logger = logging.getLogger(__name__)
 
@@ -98,6 +100,7 @@ class Protocol:
         if "virtual_fit_options" in d:
             d['virtual_fit_options'] = VirtualFitOptions.from_dict(d['virtual_fit_options'])
         d["analysis_options"] = SolutionAnalysisOptions.from_dict(d.get("analysis_options", {}))
+        d["scaling_options"] = d.get("scaling_options", {})
         return Protocol(**d)
 
     def to_dict(self):
@@ -117,6 +120,7 @@ class Protocol:
             "target_constraints": [tc.to_dict() for tc in self.target_constraints],
             "virtual_fit_options": self.virtual_fit_options.to_dict(),
             "analysis_options": self.analysis_options.to_dict(),
+            "scaling_options": self.scaling_options,
         }
 
     @staticmethod
@@ -251,8 +255,6 @@ class Protocol:
         analysis_options: SolutionAnalysisOptions | None = None,
         on_pulse_mismatch: OnPulseMismatchAction = OnPulseMismatchAction.ERROR,
         voltage: float = 1.0,
-        focal_hit_counts: List[int] | None = None,
-        optimize: bool = False,
         _force_cpu: bool = False
     ) -> Tuple[Solution, xa.DataArray, SolutionAnalysis]:
         """Calculate the solution and aggregated k-wave simulation outputs.
@@ -319,19 +321,12 @@ class Protocol:
         simulation_result_aggregated: xa.Dataset = xa.Dataset()
         foci: List[Point] = self.focal_pattern.get_targets(target)
 
-        user_provided_hit_counts = focal_hit_counts
+        if self.sequence.focus_order is not None and max(self.sequence.focus_order) > len(foci):
+            raise ValueError(f"Focus order index {max(self.sequence.focus_order)} exceeds number of foci ({len(foci)})")
 
-        if focal_hit_counts is not None:
-            if len(focal_hit_counts) != len(foci):
-                raise ValueError(f"Focal hit counts length ({len(focal_hit_counts)}) does not match number of foci ({len(foci)})")
-            if sum(focal_hit_counts) != self.sequence.pulse_count:
-                raise ValueError(f"Focal hit counts sum ({sum(focal_hit_counts)}) does not match sequence.pulse_count ({self.sequence.pulse_count})")
-        else:
-            # updating solution sequence if pulse mismatch
-            if (self.sequence.pulse_count % len(foci)) != 0:
-                self.fix_pulse_mismatch(on_pulse_mismatch, foci)
-            focal_hit_counts = [self.sequence.pulse_count // len(foci)] * len(foci)
-
+        # updating solution sequence if pulse mismatch
+        if self.sequence.focus_order is None and (self.sequence.pulse_count % len(foci)) != 0:
+            self.fix_pulse_mismatch(on_pulse_mismatch, foci)
         # run simulation and aggregate the results
         for focus in foci:
             self.logger.info(f"Beamform for focus {focus}...")
@@ -354,7 +349,6 @@ class Protocol:
             voltage=voltage,
             sequence=self.sequence,
             foci=foci,
-            focal_hit_counts=focal_hit_counts,
             target=target,
             simulation_result=xa.Dataset(),
             approved=False,
@@ -371,17 +365,6 @@ class Protocol:
                 _force_cpu=_force_cpu)
             solution.simulation_result = simulation_result
 
-        # optimize hit counts using per focus ISPPA and TIC
-        if optimize and simulate and user_provided_hit_counts is None:
-            self.logger.info(f"Optimizing hit counts for solution {solution.id}...")
-            preliminary_analysis = solution.analyze(options=analysis_options, param_constraints=self.param_constraints)
-            solution.focal_hit_counts = optimize_hit_counts(
-                per_focus_isppa=preliminary_analysis.mainlobe_isppa_Wcm2,
-                per_focus_tic=preliminary_analysis.per_focus_tic,
-                pulse_count=self.sequence.pulse_count,
-                param_constraints=self.param_constraints,
-            )
-
         # optionally scale the solution with simulation result
         if scale:
             if not simulate:
@@ -389,18 +372,21 @@ class Protocol:
                 raise ValueError(f"Cannot scale solution {solution.id} if simulation is not enabled!")
             self.logger.info(f"Scaling solution {solution.id}...")
             #TODO can analysis be an attribute of solution ?
-            solution.scale(self.focal_pattern, analysis_options=analysis_options)
+            solution.scale(self.focal_pattern, analysis_options=analysis_options, **self.scaling_options)
 
         if simulate:
             # Finally the resulting pressure is max-aggregated and intensity is mean-aggregated, over all focus points .
             pnp_aggregated = solution.simulation_result['p_min'].max(dim="focal_point_index", keep_attrs=True)
             ppp_aggregated = solution.simulation_result['p_max'].max(dim="focal_point_index", keep_attrs=True)
-            # mean is weighted by the number of times each point is focused on
-            hit_weights = xa.DataArray(
-                np.array(solution.focal_hit_counts, dtype=float) / sum(solution.focal_hit_counts),
-                dims="focal_point_index",
+            focus_counts = solution.get_focus_counts()
+            focus_weights = xa.DataArray(
+                focus_counts / np.sum(focus_counts),
+                dims=("focal_point_index",),
+                coords={"focal_point_index": solution.simulation_result.coords["focal_point_index"]},
             )
-            intensity_aggregated = (solution.simulation_result['intensity'] * hit_weights).sum(dim="focal_point_index", keep_attrs=True)
+            intensity = solution.simulation_result['intensity']
+            intensity_aggregated = (intensity * focus_weights).sum(dim="focal_point_index", keep_attrs=True)
+            intensity_aggregated.attrs.update(intensity.attrs)
             simulation_result_aggregated = deepcopy(solution.simulation_result)
             simulation_result_aggregated = simulation_result_aggregated.drop_dims("focal_point_index")
             simulation_result_aggregated['p_min'] = pnp_aggregated
